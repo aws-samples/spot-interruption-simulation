@@ -46,7 +46,7 @@ https://aws.amazon.com/about-aws/whats-new/2021/10/aws-fault-injection-simulator
 
 ### Security
 
-See [CONTRIBUTING](CONTRIBUTING.md#Security issue notifications) for more information.
+See [CONTRIBUTING](CONTRIBUTING.md#security-issue-notifications) for more information.
 
 ## License
 
