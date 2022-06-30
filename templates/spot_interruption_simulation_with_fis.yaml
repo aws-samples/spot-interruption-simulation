@@ -1,0 +1,363 @@
+Parameters:
+
+  SpotASG:
+    Description: "Auto Scaling Group Name for Spot interruption simulation"
+    Type: String
+    Default: "mySpotASG"
+
+  ChaosSchedule:
+    Description: "Schedule for Chaos, eg: rate(5 minutes)"
+    #Description: "Schedule for Chaos, eg: cron(0/10 * * * ? *) see Link:https://docs.aws.amazon.com/AmazonCloudWatch/latest/events/ScheduledEvents.html#CronExpressions
+    Type: String
+    Default: rate(5 minutes)
+
+  AssetsBucket:
+    Description: "Region-specific assets S3 bucket name (e.g. assets-prod-us-east-1)"
+    Type: String
+  AssetsKeyPrefix:
+    Description: "S3 key prefix where lambda assets are stored. (e.g. spot/)"
+    Type: String
+    Default: "spot/"
+
+Resources:
+  SpotChaos:
+    Type: AWS::Lambda::Function
+    DependsOn:
+      - SimulationStepFunction
+    Properties:
+      Handler: chaos_lambda.lambda_handler
+      Role: !GetAtt SpotChaosRole.Arn
+      Runtime: python3.8
+      Timeout: '60'
+      Code:
+        S3Bucket: !Ref AssetsBucket
+        S3Key: !Join ['', [!Ref AssetsKeyPrefix, "lambdas.zip"]]
+      Environment:
+        Variables:
+          SIMULATION_STEP_FN_ARN: !GetAtt SimulationStepFunction.Arn
+  SpotChaosRole:
+    Type: "AWS::IAM::Role"
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+        - Effect: Allow
+          Principal:
+            Service:
+            - lambda.amazonaws.com
+          Action:
+          - sts:AssumeRole
+      Policies:
+      -
+        PolicyName: SpotChaosPolicy
+        PolicyDocument:
+          Statement:
+          - Effect: Allow
+            Action:
+            - logs:CreateLogGroup
+            - logs:CreateLogStream
+            - logs:PutLogEvents
+            - logs:DescribeLogStreams
+            - states:StartExecution
+            Resource: "*"
+            # need to scope this down eventually
+          - Effect: Allow
+            Action: "*"
+            Resource: "*"
+  SpotChaosInvokePermission:
+    Type: 'AWS::Lambda::Permission'
+    Properties:
+      Action: 'lambda:InvokeFunction'
+      FunctionName: !GetAtt
+        - SpotChaos
+        - Arn
+      Principal: events.amazonaws.com
+      SourceArn: !GetAtt
+        - ChaosCronRuleASG
+        - Arn
+  ChaosCronRuleASG:
+    Type: 'AWS::Events::Rule'
+    DependsOn:
+      - SpotChaos
+    Properties:
+      Description: Scoring Event Rule
+      ScheduleExpression: !Ref ChaosSchedule
+      State: ENABLED
+      Targets:
+        - Arn: !GetAtt
+            - SpotChaos
+            - Arn
+          Id: ChaosSpotScheduler
+
+  # Step functions state machine
+  SimulationStepFunction:
+    Type: 'AWS::StepFunctions::StateMachine'
+    Properties:
+      DefinitionString:
+        Fn::Join:
+          - ''
+          - - '{
+                                   "Comment": "this workflow waits for 80 seconds and invokes Lambda",
+                                   "StartAt": "Wait",
+                                   "States": {
+                                     "Wait": {
+                                       "Type": "Wait",
+                                       "Seconds": 80,
+                                       "Next": "Lambda Invoke"
+                                     },
+                                     "Lambda Invoke": {
+                                       "Type": "Task",
+                                       "Resource": "arn:aws:states:::lambda:invoke",
+                                       "OutputPath": "$.Payload",
+                                       "Parameters": {
+                                         "Payload.$": "$",
+                                         "FunctionName": "'
+            - !GetAtt TriggerLoad.Arn
+            - '"},
+                                       "Retry": [
+                                         {
+                                           "ErrorEquals": [
+                                             "Lambda.ServiceException",
+                                             "Lambda.AWSLambdaException",
+                                             "Lambda.SdkClientException"
+                                           ],
+                                           "IntervalSeconds": 2,
+                                           "MaxAttempts": 6,
+                                           "BackoffRate": 2
+                                         }
+                                       ],
+                                       "End": true
+                                     }
+                                   }
+                                 }'
+      RoleArn: !GetAtt SimulationStepFunctionRole.Arn
+
+  # IAM roles
+  SimulationStepFunctionRole:
+    Type: 'AWS::IAM::Role'
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: !Sub 'states.${AWS::Region}.amazonaws.com'
+            Action: 'sts:AssumeRole'
+      Policies:
+        - PolicyName: lambda
+          PolicyDocument:
+            Statement:
+              - Effect: Allow
+                Action: 'lambda:InvokeFunction'
+                Resource: "*"
+
+  AvailabilityCheck:
+    Type: AWS::Lambda::Function
+    Properties:
+      Handler: availability_check.lambda_handler
+      Role: !GetAtt AvailabilityCheckRole.Arn
+      Runtime: python3.8
+      Timeout: '300'
+      Code:
+        S3Bucket: !Ref AssetsBucket
+        S3Key: !Join [ '', [ !Ref AssetsKeyPrefix, "lambdas.zip" ] ]
+  AvailabilityCheckRole:
+    Type: "AWS::IAM::Role"
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+                - lambda.amazonaws.com
+            Action:
+              - sts:AssumeRole
+      Policies:
+        - PolicyName: AvailabilityCheckPolicy
+          PolicyDocument:
+            Statement:
+              - Effect: Allow
+                Action:
+                  - logs:CreateLogGroup
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                  - logs:DescribeLogStreams
+                Resource: "*"
+                # need to scope this down eventually
+              - Effect: Allow
+                Action: "*"
+                Resource: "*"
+
+  ## FIS code for spot interruption simulation/chaos
+  FISRole:
+    Type: AWS::IAM::Role
+    Properties:
+      Policies:
+        - PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Action:
+                  - fis:*
+                Resource: '*'
+                Effect: Allow
+              - Action:
+                  - fis:InjectApiInternalError
+                  - fis:InjectApiThrottleError
+                  - fis:InjectApiUnavailableError
+                Resource: 'arn:*:fis:*:*:experiment/*'
+                Effect: Allow
+              - Action:
+                  - ec2:DescribeInstances
+                  - ecs:DescribeClusters
+                  - ecs:ListContainerInstances
+                  - eks:DescribeNodegroup
+                  - iam:ListRoles
+                  - rds:DescribeDBInstances
+                  - rds:DescribeDbClusters
+                  - ssm:ListCommands
+                Resource: '*'
+                Effect: Allow
+              - Action:
+                  - ec2:RebootInstances
+                  - ec2:StopInstances
+                  - ec2:StartInstances
+                  - ec2:TerminateInstances
+                Resource: 'arn:aws:ec2:*:*:instance/*'
+                Effect: Allow
+              - Action:
+                  - ssm:SendCommand
+                Resource:
+                  - 'arn:aws:ec2:*:*:instance/*'
+                  - 'arn:aws:ssm:*:*:document/*'
+                Effect: Allow
+              - Action:
+                  - ssm:CancelCommand
+                Resource: '*'
+                Effect: Allow
+              - Action:
+                  - ec2:SendSpotInstanceInterruptions
+                Resource: 'arn:aws:ec2:*:*:instance/*'
+                Effect: Allow
+          PolicyName: FIS-Experiment-Pol
+      Path: /
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: "Allow"
+            Principal:
+              Service:
+                - "fis.amazonaws.com"
+            Action: "sts:AssumeRole"
+  FISServiceRole:
+    Type: 'AWS::IAM::ServiceLinkedRole'
+    Properties:
+      AWSServiceName: fis.amazonaws.com
+      Description: Role to enable AWS FIS to manage monitoring and resource selection for experiments.
+
+  # this template has value of asg name for selecting the instances. with count
+  ExperimentTemplateSpot1:
+    DependsOn:
+      - FISRole
+    Type: AWS::FIS::ExperimentTemplate
+    Properties:
+      Description: "Spot_ASG_FIS_Experiment_Template_1"
+      StopConditions:
+        - Source: "none"
+      Targets:
+        myInstance:
+          ResourceType: "aws:ec2:spot-instance"
+          ResourceTags:
+            aws:autoscaling:groupName: !Ref SpotASG
+          Filters:
+            - Path: State.Name
+              Values:
+                - running
+          SelectionMode: "COUNT(2)"
+      Actions:
+        SpotEvection:
+          ActionId: "aws:ec2:send-spot-instance-interruptions"
+          Description: "Spot Eviction"
+          Parameters: { durationBeforeInterruption: PT2M }
+          Targets:
+            SpotInstances: "myInstance"
+      RoleArn:
+        !GetAtt FISRole.Arn
+      Tags:
+        Purpose: "SpotEviction"
+
+  ExperimentTemplateSpot2:
+    DependsOn:
+      - FISRole
+    Type: AWS::FIS::ExperimentTemplate
+    Properties:
+      Description: "Spot_ASG_FIS_Experiment_Template_2"
+      StopConditions:
+        - Source: "none"
+      Targets:
+        myInstance:
+          ResourceType: "aws:ec2:spot-instance"
+          ResourceTags:
+            aws:autoscaling:groupName: !Ref SpotASG
+          Filters:
+            - Path: State.Name
+              Values:
+                - running
+          SelectionMode: "PERCENT(100)"
+      Actions:
+        SpotEvection:
+          ActionId: "aws:ec2:send-spot-instance-interruptions"
+          Description: "Spot Eviction"
+          Parameters: { durationBeforeInterruption: PT2M }
+          Targets:
+            SpotInstances: "myInstance"
+      RoleArn:
+        !GetAtt FISRole.Arn
+      Tags:
+        Purpose: "SpotEviction"
+
+  TriggerLoad:
+    Type: AWS::Lambda::Function
+    DependsOn:
+      -  AvailabilityCheck
+    Properties:
+      Handler: trigger_load.lambda_handler
+      Role: !GetAtt TriggerLoadRole.Arn
+      Runtime: python3.8
+      Timeout: '30'
+      Code:
+        S3Bucket: !Ref AssetsBucket
+        S3Key: !Join ['', [!Ref AssetsKeyPrefix, "lambdas.zip"]]
+      Environment:
+        Variables:
+          AVAILABILITY_LAMBDA_ARN: !GetAtt AvailabilityCheck.Arn
+  TriggerLoadRole:
+    Type: "AWS::IAM::Role"
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+        - Effect: Allow
+          Principal:
+            Service:
+            - lambda.amazonaws.com
+          Action:
+          - sts:AssumeRole
+      Policies:
+      -
+        PolicyName: TriggerLoadPolicy
+        PolicyDocument:
+          Statement:
+          - Effect: Allow
+            Action:
+            - logs:CreateLogGroup
+            - logs:CreateLogStream
+            - logs:PutLogEvents
+            - logs:DescribeLogStreams
+            - lambda:InvokeFunction
+            - lambda:InvokeAsync
+            Resource: "*"
+            # need to scope this down eventually
+          - Effect: Allow
+            Action: "*"
+            Resource: "*"
